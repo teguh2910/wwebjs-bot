@@ -62,7 +62,7 @@ client.on('ready', async () => {
     // Sesuaikan cron schedule string jika zona waktu server berbeda
     // Cron string: menit jam hari_bulan bulan hari_minggu
     // '0 8 * * *' berarti jam 08:00 setiap hari
-    cron.schedule('* * * * *', async () => {
+    cron.schedule('0 8 * * *', async () => {
         console.log('Memicu pengiriman reminder stok kritis terjadwal...');
         if (!client.info.wid._serialized) { // Cek apakah bot masih terhubung
             console.error('Client WhatsApp belum siap untuk mengirim reminder. Melewatkan jadwal.');
