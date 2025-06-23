@@ -1,12 +1,15 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
-// const axios = require('axios'); // Hapus jika tidak digunakan
+const axios = require('axios'); // Diperlukan untuk memanggil API Laravel
+const cron = require('node-cron'); // Import node-cron
 
-const dialogflow = require('@google-cloud/dialogflow'); // Hapus jika tidak digunakan
-const uuid = require('uuid'); // Hapus jika tidak digunakan
+// --- PENTING: Import Google Cloud Dialogflow SDK ---
+const dialogflow = require('@google-cloud/dialogflow');
+const uuid = require('uuid');
 
 require('dotenv').config();
 
+// --- Konfigurasi Google Cloud/Dialogflow dari .env ---
 const GOOGLE_CLOUD_PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT_ID;
 
 if (!GOOGLE_CLOUD_PROJECT_ID || !process.env.GOOGLE_APPLICATION_CREDENTIALS) {
@@ -16,10 +19,17 @@ if (!GOOGLE_CLOUD_PROJECT_ID || !process.env.GOOGLE_APPLICATION_CREDENTIALS) {
 const sessionClient = GOOGLE_CLOUD_PROJECT_ID && process.env.GOOGLE_APPLICATION_CREDENTIALS ? 
     new dialogflow.SessionsClient({ keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS }) : null;
 
-const mode = process.argv[2];
-const targetId = process.argv[3];
-const reminderMessage = process.argv[4];
+// --- Konfigurasi API Laravel dan Reminder dari .env ---
+const LARAVEL_API_BASE_URL = process.env.LARAVEL_API_BASE_URL; // URL API Laravel
+const WHATSAPP_REMINDER_GROUP_JID = process.env.WHATSAPP_REMINDER_GROUP_JID; // JID grup target reminder
 
+if (!LARAVEL_API_BASE_URL || !WHATSAPP_REMINDER_GROUP_JID) {
+    console.error('Error: LARAVEL_API_BASE_URL atau WHATSAPP_REMINDER_GROUP_JID tidak didefinisikan di .env file!');
+    console.error('Reminder otomatis tidak akan berfungsi.');
+    // Tidak exit, biarkan bot tetap berjalan untuk interaktif
+}
+
+// --- Inisialisasi WhatsApp Client ---
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
@@ -43,130 +53,134 @@ client.on('qr', qr => {
 
 client.on('ready', async () => {
     console.log('WhatsApp Bot siap digunakan!');
+    console.log('Mode Interaktif: Bot siap menjawab pertanyaan.');
+    console.log('Pastikan untuk menambahkan bot ke grup dan mention bot agar merespons.');
 
-    if (mode === 'reminder' && targetId && reminderMessage) {
-        console.log(`Mode Reminder: Mencoba mengirim pesan ke ${targetId}...`);
-        
-        try {
-            // Tunggu sebentar untuk memastikan sesi stabil SEBELUM mencoba kirim
-            await new Promise(resolve => setTimeout(resolve, 3000)); // Tunggu 3 detik
-
-            const chat = await client.getChatById(targetId); // Coba lagi dapatkan objek chat
-            if (!chat) {
-                console.error(`Error: Target chat (ID ${targetId}) tidak ditemukan.`);
-                client.destroy();
-                process.exit(1);
-            }
-
-            // --- PENGIRIMAN PESAN DAN PENUNDAAN KELUAR YANG LEBIH BAIK ---
-            const sentMessage = await client.sendMessage(targetId, reminderMessage);
-            
-            if (sentMessage && sentMessage.id && sentMessage.id.fromMe) {
-                console.log('Pesan reminder berhasil di-queue untuk dikirim:', sentMessage.id._serialized);
-                // Tunggu beberapa detik lagi setelah pesan dianggap terkirim
-                // untuk memberi waktu WhatsApp memproses pengiriman aktual
-                await new Promise(resolve => setTimeout(resolve, 5000)); // Tunggu 5 detik tambahan
-                console.log('Penundaan selesai. Mematikan bot untuk mode reminder...');
-                client.destroy();
-                process.exit(0);
-            } else {
-                console.error('Error: Pesan tidak mendapatkan konfirmasi ID yang valid setelah dikirim.');
-                console.error('Response pengiriman:', sentMessage);
-                client.destroy();
-                process.exit(1);
-            }
-        } catch (error) {
-            console.error('Terjadi kesalahan saat mengirim pesan reminder:', error.message);
-            if (error.message.includes("Message failed to send")) {
-                console.error("Pesan gagal dikirim oleh WhatsApp API. Cek izin bot di grup atau nomor tujuan.");
-            } else if (error.message.includes("Timed out")) {
-                console.error("Pengiriman timeout. Koneksi mungkin tidak stabil.");
-            } else if (error.message.includes("Evaluation failed:")) {
-                 console.error("Puppeteer/Browser error. Coba headless: false untuk debug visual.");
-            }
-            client.destroy();
-            process.exit(1);
-        }
-
-    } else {
-        // --- LOGIKA MODE INTERAKTIF (Default) ---
-        console.log('Mode Interaktif: Bot siap menjawab pertanyaan.');
-        console.log('Pastikan untuk menambahkan bot ke grup dan mention bot agar merespons.');
-    }
-});
-// --- HANYA AKTIFKAN LISTENER PESAN JIKA DALAM MODE INTERAKTIF ---
-if (mode !== 'reminder') {
-    client.on('message', async msg => {
-        const chat = await msg.getChat();
-
-        // Logika untuk merespons hanya jika di-mention di grup atau di private chat
-        if (chat.isGroup) {
-            const botId = client.info.wid._serialized;
-            const isBotMentioned = msg.mentionedIds.includes(botId);
-            if (!isBotMentioned) {
-                return;
-            }
-        }
-
-        let rawText = msg.body;
-        // Bersihkan mention dan karakter aneh lainnya
-        let cleanedText = rawText.replace(/\b\d{10,15}@c\.us\b/g, '')
-                                .replace(/@\d{10,15}\s?/g, '')
-                                .replace(/\u200e/g, '')
-                                .replace(/\u00a0/g, ' ')
-                                .replace(/\s+/g, ' ')
-                                .trim();
-        
-        if (!cleanedText) {
+    // --- JADWALKAN REMINDER INTERNAL DI BOT WHATSAPP ---
+    console.log(`Menjadwalkan reminder stok kritis ke grup ${WHATSAPP_REMINDER_GROUP_JID} setiap hari jam 08:00 WIB.`);
+    
+    // Sesuaikan cron schedule string jika zona waktu server berbeda
+    // Cron string: menit jam hari_bulan bulan hari_minggu
+    // '0 8 * * *' berarti jam 08:00 setiap hari
+    cron.schedule('* * * * *', async () => {
+        console.log('Memicu pengiriman reminder stok kritis terjadwal...');
+        if (!client.info.wid._serialized) { // Cek apakah bot masih terhubung
+            console.error('Client WhatsApp belum siap untuk mengirim reminder. Melewatkan jadwal.');
             return;
         }
 
-        // --- LOGIKA MENGIRIM PESAN KE DIALOGFLOW MENGGUNAKAN SDK ---
-        const sessionId = msg.from; // ID pengirim pesan sebagai session ID Dialogflow
-        const sessionPath = sessionClient.projectAgentSessionPath(GOOGLE_CLOUD_PROJECT_ID, sessionId);
-
-        const request = {
-            session: sessionPath,
-            queryInput: {
-                text: {
-                    text: cleanedText,
-                    languageCode: 'id', // Pastikan ini sesuai dengan bahasa Agent Dialogflow Anda
-                },
-            },
-        };
-
         try {
-            console.log(`Mengirim pesan ke Dialogflow: "${cleanedText}" untuk sesi ${sessionId}`);
-            const responses = await sessionClient.detectIntent(request);
-            const result = responses[0].queryResult;
+            // Panggil API Laravel untuk mendapatkan daftar stok kritis
+            const response = await axios.post(`${LARAVEL_API_BASE_URL}/api/chatbot/urgent-stocks`);
 
-            let replyMessage = result.fulfillmentText;
-
-            if (!replyMessage && result.intent && result.intent.displayName) {
-                console.warn(`Intent "${result.intent.displayName}" terdeteksi, tetapi fulfillmentText kosong. Cek log webhook Anda.`);
-                replyMessage = `Saya mengerti maksud Anda "${result.intent.displayName}", tetapi ada masalah saat mengambil informasi.`;
-            } else if (!replyMessage) {
-                replyMessage = "Maaf, saya tidak mengerti. Bisakah Anda mengulanginya dengan cara lain?";
+            let reminderContent;
+            if (response.data.status === 'success') {
+                reminderContent = response.data.answer;
+            } else {
+                reminderContent = 'Maaf, terjadi kesalahan saat mengambil daftar stok kritis dari sistem. ' + response.data.message;
+                console.error('API Error saat jadwal reminder:', response.data.message);
             }
-            
-            msg.reply(replyMessage);
+
+            // Tambahkan header khusus untuk reminder
+            const finalReminderMessage = `🔔 *Pengingat Stok Kritis Hari Ini* 🔔\n\n${reminderContent}\n\nSegera periksa material-material ini di aplikasi!`;
+
+            // Kirim pesan ke grup target
+            const chat = await client.getChatById(WHATSAPP_REMINDER_GROUP_JID);
+            if (chat) {
+                const sentMessage = await chat.sendMessage(finalReminderMessage);
+                if (sentMessage && sentMessage.id) {
+                    console.log('Reminder stok kritis berhasil dikirim secara terjadwal.');
+                } else {
+                    console.error('Error: Reminder tidak mendapatkan ID pesan setelah dikirim.');
+                }
+            } else {
+                console.error('Error: Grup reminder (JID) tidak ditemukan.');
+            }
 
         } catch (error) {
-            console.error('Error saat memanggil Dialogflow API:', error.message);
-            if (error.code === 7 || error.code === 14) {
-                msg.reply('Maaf, bot tidak dapat terhubung ke layanan Dialogflow. Pastikan kredensial dan koneksi internet bot sudah benar.');
-            } else {
-                msg.reply('Maaf, ada masalah saat memproses permintaan Anda. Silakan coba lagi nanti.');
+            console.error('Error saat menjalankan jadwal reminder:', error.message);
+            if (error.response) {
+                console.error('API Laravel Response Data (Reminder):', error.response.data);
+                console.error('API Laravel Response Status (Reminder):', error.response.status);
             }
         }
+    }, {
+        timezone: "Asia/Jakarta" // Penting! Sesuaikan dengan zona waktu server Anda (misal: "Asia/Jakarta" untuk WIB)
     });
-}
+});
 
+// --- LISTENER PESAN INTERAKTIF (Sama seperti sebelumnya) ---
+client.on('message', async msg => {
+    const chat = await msg.getChat();
 
-// Ini penting untuk memastikan listener 'disconnected' juga mematikan proses saat tidak sengaja terputus
+    if (chat.isGroup) {
+        const botId = client.info.wid._serialized;
+        const isBotMentioned = msg.mentionedIds.includes(botId);
+        if (!isBotMentioned) {
+            return;
+        }
+    }
+
+    let rawText = msg.body;
+    let cleanedText = rawText.replace(/\b\d{10,15}@c\.us\b/g, '')
+                            .replace(/@\d{10,15}\s?/g, '')
+                            .replace(/\u200e/g, '')
+                            .replace(/\u00a0/g, ' ')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+    
+    if (!cleanedText) {
+        return;
+    }
+
+    if (!sessionClient) {
+        msg.reply('Maaf, bot tidak dapat memproses pertanyaan karena konfigurasi Dialogflow tidak lengkap. Mohon hubungi administrator.');
+        return;
+    }
+    
+    const sessionId = msg.from;
+    const sessionPath = sessionClient.projectAgentSessionPath(GOOGLE_CLOUD_PROJECT_ID, sessionId);
+
+    const request = {
+        session: sessionPath,
+        queryInput: {
+            text: {
+                text: cleanedText,
+                languageCode: 'id',
+            },
+        },
+    };
+
+    try {
+        console.log(`Mengirim pesan ke Dialogflow: "${cleanedText}" untuk sesi ${sessionId}`);
+        const responses = await sessionClient.detectIntent(request);
+        const result = responses[0].queryResult;
+
+        let replyMessage = result.fulfillmentText;
+
+        if (!replyMessage && result.intent && result.intent.displayName) {
+            console.warn(`Intent "${result.intent.displayName}" terdeteksi, tetapi fulfillmentText kosong. Cek log webhook Anda.`);
+            replyMessage = `Saya mengerti maksud Anda "${result.intent.displayName}", tetapi ada masalah saat mengambil informasi.`;
+        } else if (!replyMessage) {
+            replyMessage = "Maaf, saya tidak mengerti. Bisakah Anda mengulanginya dengan cara lain?";
+        }
+        
+        msg.reply(replyMessage);
+
+    } catch (error) {
+        console.error('Error saat memanggil Dialogflow API:', error.message);
+        if (error.code === 7 || error.code === 14) {
+            msg.reply('Maaf, bot tidak dapat terhubung ke layanan Dialogflow. Pastikan kredensial dan koneksi internet bot sudah benar.');
+        } else {
+            msg.reply('Maaf, ada masalah saat memproses permintaan Anda. Silakan coba lagi nanti.');
+        }
+    }
+});
+
 client.on('disconnected', (reason) => {
     console.log('WhatsApp Bot terputus!', reason);
-    process.exit(1); // Keluar dengan kode error jika terputus
+    // Ini penting agar proses tidak nyangkut jika terputus
+    process.exit(1); 
 });
 
 client.initialize();
